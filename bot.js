@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const http = require('node:http');
 const { Telegraf } = require('telegraf');
 const OpenAI = require('openai');
@@ -37,12 +39,43 @@ function parseAllowedUsers(raw) {
   return new Set(parsed);
 }
 
+function loadJson(filePath, label) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Unable to load ${label}: ${error.message}`);
+  }
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const personaPath = path.join(__dirname, 'personas', 'remielle.md');
+const lorebookPath = path.join(__dirname, 'lorebooks', 'remielle.json');
+const personaPrompt = fs.readFileSync(personaPath, 'utf8').trim();
+const lorebook = loadJson(lorebookPath, 'Remielle lorebook');
+
+if (!Array.isArray(lorebook.entries)) throw new Error('The Remielle lorebook must contain an entries array.');
+for (const entry of lorebook.entries) {
+  if (!entry.id || !entry.title || !Array.isArray(entry.keywords) || !entry.content) {
+    throw new Error(`Invalid lorebook entry: ${entry.id || 'unknown'}`);
+  }
+}
+
+const loreDefaults = lorebook.matching || {};
+const customSystemPrompt = process.env.SYSTEM_PROMPT?.trim();
+const systemPrompt = [
+  personaPrompt,
+  customSystemPrompt ? `\n\n## Additional owner instructions\n${customSystemPrompt}` : '',
+].filter(Boolean).join('\n');
+
 const config = {
   telegramToken: process.env.TELEGRAM_TOKEN,
   apiKey: process.env.API_KEY || process.env.OPENAI_API_KEY,
   baseURL: process.env.BASE_URL || 'https://api.openai.com/v1',
   model: process.env.MODEL || 'gpt-4o-mini',
-  systemPrompt: process.env.SYSTEM_PROMPT || 'Kamu adalah asisten AI yang jujur, helpful, dan langsung ke inti. Jawab dalam bahasa yang digunakan pengguna.',
+  systemPrompt,
   allowedUsers: parseAllowedUsers(process.env.ALLOWED_USERS),
   allowGroups: readBoolean('ALLOW_GROUPS', false),
   maxInputChars: readNumber('MAX_INPUT_CHARS', 12000, { min: 100, max: 100000 }),
@@ -53,6 +86,9 @@ const config = {
   apiTimeoutMs: readNumber('API_TIMEOUT_MS', 90000, { min: 5000, max: 300000 }),
   apiMaxRetries: readNumber('API_MAX_RETRIES', 2, { min: 0, max: 5 }),
   maxTokens: readNumber('MAX_TOKENS', 0, { min: 0, max: 1000000 }),
+  maxLoreEntries: readNumber('MAX_LORE_ENTRIES', loreDefaults.maxEntriesPerTurn || 4, { min: 0, max: 12 }),
+  maxLoreChars: readNumber('MAX_LORE_CHARS', loreDefaults.maxContextChars || 8500, { min: 0, max: 30000 }),
+  loreRecentUserMessages: readNumber('LORE_RECENT_USER_MESSAGES', loreDefaults.recentUserMessages || 2, { min: 0, max: 10 }),
   port: readNumber('PORT', 3000, { min: 1, max: 65535 }),
 };
 
@@ -97,7 +133,7 @@ function getSession(key) {
 
   let session = sessions.get(key);
   if (!session) {
-    session = { messages: [], touchedAt: now };
+    session = { messages: [], touchedAt: now, lastLoreTitles: [] };
     sessions.set(key, session);
   }
 
@@ -129,6 +165,51 @@ function enqueue(key, task) {
 
 function safeText(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function keywordMatches(text, keyword) {
+  const phrase = String(keyword).trim().split(/\s+/).map(escapeRegex).join('\\s+');
+  if (!phrase) return false;
+  const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_])${phrase}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
+  return pattern.test(text);
+}
+
+function getTriggeredLore(session, userText) {
+  const allPreviousUserMessages = session.messages.filter((message) => message.role === 'user');
+  const previousUserMessages = config.loreRecentUserMessages > 0
+    ? allPreviousUserMessages.slice(-config.loreRecentUserMessages).map((message) => message.content)
+    : [];
+  const searchText = [...previousUserMessages, userText].join('\n');
+
+  const matches = lorebook.entries
+    .filter((entry) => entry.keywords.some((keyword) => keywordMatches(searchText, keyword)))
+    .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+  const selected = [];
+  let usedChars = 0;
+  for (const entry of matches) {
+    if (selected.length >= config.maxLoreEntries) break;
+    const block = `## ${entry.title}\n${entry.content}`;
+    if (usedChars + block.length > config.maxLoreChars) continue;
+    selected.push({ entry, block });
+    usedChars += block.length;
+  }
+
+  return selected;
+}
+
+function buildSystemPrompt(session, userText) {
+  const triggered = getTriggeredLore(session, userText);
+  session.lastLoreTitles = triggered.map(({ entry }) => entry.title);
+  if (triggered.length === 0) return config.systemPrompt;
+
+  const loreContext = [
+    '## Relevant canon lore (keyword-triggered)',
+    'The following notes were selected because related keywords appeared in the recent conversation. Use only the relevant details; do not force them into unrelated answers.',
+    ...triggered.map(({ block }) => block),
+  ].join('\n\n');
+
+  return `${config.systemPrompt}\n\n${loreContext}`;
 }
 
 function splitTelegramMessage(text, limit = 3900) {
@@ -187,7 +268,7 @@ async function handleText(ctx) {
   await enqueue(key, async () => {
     const session = getSession(key);
     const requestMessages = [
-      { role: 'system', content: config.systemPrompt },
+      { role: 'system', content: buildSystemPrompt(session, userText) },
       ...session.messages,
       { role: 'user', content: userText },
     ];
@@ -220,10 +301,11 @@ async function handleText(ctx) {
 
       await replyInChunks(ctx, answer);
       const usage = completion.usage?.total_tokens;
-      console.log(`[chat] user=${ctx.from.id} model=${config.model} total_tokens=${usage ?? 'n/a'}`);
+      const loreLog = session.lastLoreTitles.length ? ` lore=${session.lastLoreTitles.length}` : '';
+      console.log(`[chat] user=${ctx.from.id} model=${config.model} total_tokens=${usage ?? 'n/a'}${loreLog}`);
     } catch (error) {
       logApiError(error);
-      await ctx.reply('Gagal mendapatkan respons dari model. Coba lagi sebentar lagi.').catch(() => {});
+      await ctx.reply('Sepertinya jalurnya sedang terganggu. Coba lagi sebentar, ya.').catch(() => {});
     } finally {
       if (typingTimer) clearInterval(typingTimer);
     }
@@ -233,17 +315,19 @@ async function handleText(ctx) {
 bot.start(async (ctx) => {
   if (!isAllowed(ctx)) return;
   await ctx.reply(
-    `Bot aktif. Model: ${config.model}\n\n` +
-    'Kirim pesan untuk mulai ngobrol. Gunakan /reset untuk menghapus konteks percakapan dan /status untuk melihat status bot.'
+    'Ah, akhirnya muncul juga. Aku hampir mengira harus mencari accomplice lain.\n\n' +
+    'Kirim saja apa yang sedang memenuhi pikiranmu. Kita lihat ke mana percakapan ini akan membawa kita.\n\n' +
+    'Gunakan /help untuk melihat perintah, atau /reset kalau ingin memulai dari awal.'
   );
 });
 
 bot.help(async (ctx) => {
   if (!isAllowed(ctx)) return;
   await ctx.reply(
-    '/start — mulai\n' +
+    '/start — mulai percakapan\n' +
     '/reset — hapus memory percakapan ini\n' +
-    '/status — lihat model dan status sesi\n' +
+    '/status — lihat status bot dan sesi\n' +
+    '/lore — lihat topik lorebook yang tersedia\n' +
     '/help — bantuan'
   );
 });
@@ -251,17 +335,25 @@ bot.help(async (ctx) => {
 bot.command('reset', async (ctx) => {
   if (!isAllowed(ctx)) return;
   sessions.delete(getSessionKey(ctx));
-  await ctx.reply('Konteks percakapan sudah dihapus. Kita mulai dari awal.');
+  await ctx.reply('Baiklah. Kita singkirkan jejak percakapan lama dan mulai lagi dari awal.');
 });
 
 bot.command('status', async (ctx) => {
   if (!isAllowed(ctx)) return;
   const session = sessions.get(getSessionKey(ctx));
   const messageCount = session?.messages.length || 0;
+  const activeLore = session?.lastLoreTitles?.length ? session.lastLoreTitles.join(', ') : 'tidak ada';
   await ctx.reply(
-    `Status: online\nModel: ${config.model}\nMemory sesi: ${messageCount} pesan\n` +
-    `Sesi aktif: ${sessions.size}\nTotal request sukses: ${totalRequests}`
+    `Status: online\nModel: ${config.model}\nPersona: Remielle Dan\n` +
+    `Lorebook: ${lorebook.entries.length} entri\nLore terakhir aktif: ${activeLore}\n` +
+    `Memory sesi: ${messageCount} pesan\nSesi aktif: ${sessions.size}\nTotal request sukses: ${totalRequests}`
   );
+});
+
+bot.command('lore', async (ctx) => {
+  if (!isAllowed(ctx)) return;
+  const topics = lorebook.entries.map((entry) => `• ${entry.title}`).join('\n');
+  await ctx.reply(`Lorebook Remielle memuat ${lorebook.entries.length} topik. Lore akan masuk otomatis saat keyword relevan muncul.\n\n${topics}`);
 });
 
 bot.on('text', async (ctx) => {
@@ -287,6 +379,8 @@ const server = http.createServer((req, res) => {
       service: 'telebot',
       bot: healthy ? 'running' : 'starting',
       model: config.model,
+      persona: 'remielle',
+      lorebook_entries: lorebook.entries.length,
     });
     res.writeHead(healthy ? 200 : 503, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(req.method === 'HEAD' ? undefined : body);
@@ -309,7 +403,7 @@ async function start() {
   try {
     await bot.launch();
     botStarted = true;
-    console.log(`[bot] Telegram polling started. Model=${config.model}`);
+    console.log(`[bot] Telegram polling started. Model=${config.model} Persona=Remielle Lorebook=${lorebook.entries.length}`);
   } catch (error) {
     console.error('[bot] Startup failed:', error?.name || 'Error');
     process.exitCode = 1;

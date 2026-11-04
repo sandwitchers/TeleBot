@@ -4,15 +4,27 @@ A private Telegram LLM bot using Telegraf and the OpenAI Chat Completions SDK. I
 
 ## Features
 
-- Private-user allowlist; the bot refuses to start if `ALLOWED_USERS` is missing.
+- Remielle Dan persona inspired by Zenless Zone Zero, with a concise, playful Indonesian-first voice.
+- Keyword-triggered lorebook: only relevant character/world notes are added to a request's system context.
+- Private-user allowlist; the bot denies all users if `ALLOWED_USERS` is empty.
 - Private chats only by default. Group usage must be explicitly enabled.
 - Separate conversation memory for each Telegram user and chat.
 - Automatic history trimming, session expiration, and an in-memory session limit.
-- `/reset`, `/status`, and `/help` commands.
+- `/reset`, `/status`, `/lore`, and `/help` commands.
 - Long replies are split into Telegram-safe messages.
 - API timeout/retry configuration and generic user-facing errors.
 - `/health` endpoint for Railway deployment health checks.
 - Graceful shutdown on `SIGINT` and `SIGTERM`.
+
+## Persona and keyword lorebook
+
+The default persona is loaded from `personas/remielle.md`. Lore entries live in `lorebooks/remielle.json` and are matched case-insensitively using whole-word/phrase matching. The bot checks the current message plus the last two user messages, then injects up to four matching entries into that request only. This keeps the normal prompt smaller than sending the entire lorebook every time.
+
+Included lore topics cover Remielle's identity and demeanor, New Eridu/Hollows/Ether, first-generation Void Hunters and the Guard of Staves, the Covenant of Dayat, Thaumiel and Ether suppression, Project Sunseeker/Day of Silence, Phaethon, and the Ramiel alias.
+
+To add lore, add another object to `entries` in `lorebooks/remielle.json` with a unique `id`, `title`, `keywords` array, `priority`, and `content`. Keep keywords distinctive; broad words can cause unnecessary matches. Higher `priority` entries are selected first when several entries match.
+
+`SYSTEM_PROMPT` is optional and is appended as additional owner instructions; it no longer replaces the Remielle persona. Do not use it to paste the whole lorebook.
 
 ## Required environment variables
 
@@ -28,8 +40,16 @@ A private Telegram LLM bot using Telegraf and the OpenAI Chat Completions SDK. I
 | --- | --- | --- |
 | `BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL. |
 | `MODEL` | `gpt-4o-mini` | Model name understood by your provider. |
-| `SYSTEM_PROMPT` | Built-in concise assistant prompt | System instruction for the bot. |
+| `SYSTEM_PROMPT` | empty | Optional extra owner instructions appended to the built-in persona. |
 | `MAX_TOKENS` | `0` | Optional output cap; `0` leaves the provider default. |
+
+## Lorebook limits
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MAX_LORE_ENTRIES` | `4` | Maximum matching lore entries injected per request. Set to `0` to disable lore injection. |
+| `MAX_LORE_CHARS` | `8500` | Maximum combined lore text injected per request. Set to `0` to disable lore injection. |
+| `LORE_RECENT_USER_MESSAGES` | `2` | Number of previous user messages included in keyword matching. |
 
 ## Memory and limits
 
@@ -75,7 +95,8 @@ Use a Telegram ID helper bot such as `@userinfobot` to find your numeric user ID
 
 ## Commands
 
-- `/start` — bot introduction.
+- `/start` — introduction.
 - `/help` — command list.
 - `/reset` — clear the current chat's conversation memory.
-- `/status` — model, current session size, active sessions, and successful request count.
+- `/status` — model, active session, and most recently triggered lore entries.
+- `/lore` — list available lorebook topics.
